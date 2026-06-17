@@ -1,0 +1,122 @@
+name: Maintainer CSV Consistency Check
+
+on:
+  pull_request:
+    paths:
+      - "project-maintainers.csv"
+  push:
+    branches:
+      - main
+    paths:
+      - "project-maintainers.csv"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  consistency-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout foundation repo
+        uses: actions/checkout@v4
+        with:
+          # Full history so git-blame dates are accurate
+          fetch-depth: 0
+
+      # Sparse-clone the CNCF gitdm affiliation database (affiliations files only).
+      # Used to cross-reference maintainer company names against the canonical source.
+      # continue-on-error so a network blip doesn't block the consistency check itself.
+      - name: Checkout gitdm affiliation database
+        uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          repository: cncf/gitdm
+          path: gitdm
+          fetch-depth: 1
+          sparse-checkout: |
+            developers_affiliations*.txt
+          sparse-checkout-cone-mode: false
+
+      - name: Run consistency checks
+        id: check
+        run: |
+          set +e
+
+          GITDM_ARGS=""
+          if [ -d "$GITHUB_WORKSPACE/gitdm" ]; then
+            GITDM_ARGS="--gitdm-dir $GITHUB_WORKSPACE/gitdm"
+          fi
+
+          # Main consistency report (errors + warnings)
+          python3 .github/scripts/check_maintainer_consistency.py \
+            $GITDM_ARGS \
+            > report.md 2>&1
+          EXIT_CODE=$?
+          set -e
+
+          # Append the fixable-issues table (company variants with gitdm context,
+          # given-name spelling variants) so reviewers see actionable detail.
+          python3 .github/scripts/check_maintainer_consistency.py \
+            --report-fixable \
+            $GITDM_ARGS \
+            >> report.md 2>&1 || true
+
+          echo "exit_code=${EXIT_CODE}" >> "$GITHUB_OUTPUT"
+
+          # Publish to the workflow step summary
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+          if grep -q "^### ❌" report.md; then
+            echo "has_errors=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "has_errors=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if grep -q "^### ⚠️" report.md; then
+            echo "has_warnings=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "has_warnings=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          exit "${EXIT_CODE}"
+
+      # Post (or update) a single comment on the PR so repeated pushes
+      # don't flood the thread.
+      - name: Post PR comment
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('report.md', 'utf8');
+
+            const marker = '<!-- maintainer-consistency-check -->';
+            const body   = `${marker}\n${report}`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c => c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
